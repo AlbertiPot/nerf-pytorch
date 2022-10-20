@@ -61,9 +61,12 @@ def _minify(basedir, factors=[], resolutions=[]):
         
 def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     
-    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
-    bds = poses_arr[:, -2:].transpose([1,0])
+    # comment 以fern为例
+    # poses_bounds.npy 记录了内参[H(1),W(1),focal(1)],外参[t(1*3),R(3*3)], 光线的近段和远端点（2） =17，共20张图for fern
+    # refer to https://zhuanlan.zhihu.com/p/495652881
+    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))  # 20*17 fern
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])    # 取17的前15个形成：3*15*20 fern
+    bds = poses_arr[:, -2:].transpose([1,0])    # 取17的后2两个，形成:2*20
     
     img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
             if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
@@ -94,13 +97,15 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         return
     
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    # check poses的batch数量与图片数据数对不对的上
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
         return
     
     sh = imageio.imread(imgfiles[0]).shape
+    # poses 3*5*20, 第5个维度的前2个是H,W, 第3个是焦距
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
-    poses[2, 4, :] = poses[2, 4, :] * 1./factor
+    poses[2, 4, :] = poses[2, 4, :] * 1./factor # 焦距除以下采样的尺度
     
     if not load_imgs:
         return poses, bds
@@ -138,13 +143,13 @@ def ptstocam(pts, c2w):
     return tt
 
 def poses_avg(poses):
+    # poses[20,3,5]
+    hwf = poses[0, :3, -1:] # 第5个维度h w 和focal，这里只提取第1个图的
 
-    hwf = poses[0, :3, -1:]
-
-    center = poses[:, :3, 3].mean(0)
+    center = poses[:, :3, 3].mean(0)    # index=3 的维度存的是中心点, 对20张图的中心点坐标求平均 return 20张图的h, w , f 的平均值
     vec2 = normalize(poses[:, :3, 2].sum(0))
     up = poses[:, :3, 1].sum(0)
-    c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
+    c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)    # 3*5
     
     return c2w
 
@@ -165,14 +170,14 @@ def render_path_spiral(c2w, up, rads, focal, zdelta, zrate, rots, N):
 
 def recenter_poses(poses):
 
-    poses_ = poses+0
+    poses_ = poses+0    # 加个0是为了复制到新的内存地址？
     bottom = np.reshape([0,0,0,1.], [1,4])
     c2w = poses_avg(poses)
-    c2w = np.concatenate([c2w[:3,:4], bottom], -2)
-    bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1])
-    poses = np.concatenate([poses[:,:3,:4], bottom], -2)
+    c2w = np.concatenate([c2w[:3,:4], bottom], -2)  # 相机坐标系到世界坐标系的矩阵，bottom是齐次
+    bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1]) # 将array([[[0., 0., 0., 1.]]]) 沿着 [20,1,1]复制
+    poses = np.concatenate([poses[:,:3,:4], bottom], -2)    # 为（20,3,4）中每个3*4矩阵添加一维度齐次，变成4*4
 
-    poses = np.linalg.inv(c2w) @ poses
+    poses = np.linalg.inv(c2w) @ poses # c2w   求逆，矩阵乘转换矩阵，现在的poses世界坐标系?
     poses_[:,:3,:4] = poses[:,:3,:4]
     poses = poses_
     return poses
@@ -247,11 +252,11 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     print('Loaded', basedir, bds.min(), bds.max())
     
     # Correct rotation matrix ordering and move variable dim to axis 0
-    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
-    poses = np.moveaxis(poses, -1, 0).astype(np.float32)
-    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
+    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)   # stack （3,1,20）,(3,1,20),(3,3,20) = (3,5,20)
+    poses = np.moveaxis(poses, -1, 0).astype(np.float32)    # 换轴  （3，5，20）> (20,3,5) source=-1, desti = 0 20to第一维度
+    imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)      # (378, 504, 3, 20) > (20, 378, 504, 3)
     images = imgs
-    bds = np.moveaxis(bds, -1, 0).astype(np.float32)
+    bds = np.moveaxis(bds, -1, 0).astype(np.float32)        # (20,2)
     
     # Rescale if bd_factor is provided
     sc = 1. if bd_factor is None else 1./(bds.min() * bd_factor)
@@ -259,7 +264,7 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     bds *= sc
     
     if recenter:
-        poses = recenter_poses(poses)
+        poses = recenter_poses(poses)   # 返回世界坐标系的poses?
         
     if spherify:
         poses, render_poses, bds = spherify_poses(poses, bds)

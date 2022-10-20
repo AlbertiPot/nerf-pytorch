@@ -37,25 +37,26 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]]) # batch * N_sample, 3 65536*3
+    embedded = embed_fn(inputs_flat)    # 对65536*3的数据做位置编码，升维度 65536*63
 
-    if viewdirs is not None:
-        input_dirs = viewdirs[:,None].expand(inputs.shape)
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
+    if viewdirs is not None:# 方向角度
+        input_dirs = viewdirs[:,None].expand(inputs.shape)  #1025*64*3
+        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]]) # 65536*3
+        embedded_dirs = embeddirs_fn(input_dirs_flat)   # 位置编码 65536*27
+        embedded = torch.cat([embedded, embedded_dirs], -1) # 65536*90
 
-    outputs_flat = batchify(fn, netchunk)(embedded)
-    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    outputs_flat = batchify(fn, netchunk)(embedded) # 返回一个函数 run函数，这里开始run,输出batch_size*4 (rgb+alpha)
+    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])   # 1024*64*4
     return outputs
 
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
+    # rays_flat:N*11, 3个起始点的坐标（ndc），3个方向向量的坐标（ndc），近端，远端点，3个世界坐标系下的视角
     all_ret = {}
-    for i in range(0, rays_flat.shape[0], chunk):
+    for i in range(0, rays_flat.shape[0], chunk):   # 对一个batch中的rays，每次渲染chunks根rays
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
@@ -97,30 +98,30 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays_o, rays_d = get_rays(H, W, K, c2w)
     else:
         # use provided ray batch
-        rays_o, rays_d = rays
+        rays_o, rays_d = rays # 2*1024*3
 
     if use_viewdirs:
         # provide ray directions as input
-        viewdirs = rays_d
+        viewdirs = rays_d   # rays的角度
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
             rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
+        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)    # batch内的ray的角度归一
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
-    sh = rays_d.shape # [..., 3]
+    sh = rays_d.shape # [..., 3] 1024*3
     if ndc:
         # for forward facing scenes
-        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
+        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)    # 1024*3, 1024*3 两个转换到ndc坐标系的ray起始点及方向向量
 
     # Create ray batch
     rays_o = torch.reshape(rays_o, [-1,3]).float()
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
-    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
+    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1]) # 1024*1
+    rays = torch.cat([rays_o, rays_d, near, far], -1)   #1024*8
     if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
+        rays = torch.cat([rays, viewdirs], -1)  # viewdirs是世界坐标系中的视角，未经过ndc
 
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
@@ -178,12 +179,13 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model.
     """
-    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
-
+    embed_fn, input_ch = get_embedder(args.multires, args.i_embed)  # 对3D坐标点的位置编码频率是10，multires=10
+    # input_ch=63
     input_ch_views = 0
     embeddirs_fn = None
     if args.use_viewdirs:
-        embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)
+        embeddirs_fn, input_ch_views = get_embedder(args.multires_views, args.i_embed)  # 对view angle的位置编码的频率是4，multires_views=4
+        # input_ch_views = 27
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
@@ -191,6 +193,7 @@ def create_nerf(args):
                  input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
     grad_vars = list(model.parameters())
 
+    # 用于fine采样的模型
     model_fine = None
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
@@ -272,17 +275,17 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)  # 对应文章第七页最后一行
 
-    dists = z_vals[...,1:] - z_vals[...,:-1]
+    dists = z_vals[...,1:] - z_vals[...,:-1]    # 两个采样点之间的距离 interval
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
 
-    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
+    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)  # 1024*64
 
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+        noise = torch.randn(raw[...,3].shape) * raw_noise_std   # 随机生成0-1的随机数
 
         # Overwrite randomly sampled data if pytest
         if pytest:
@@ -290,9 +293,9 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
             noise = torch.Tensor(noise)
 
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
+    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples] 生成的ray加上随机噪声, 计算每个采样点的alpha 1024*64
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1] # 对应eq5，alpha后面是Ti（eq3）: torch.ones 生成1024*1的1矩阵，与1-alpha的的1024*64拼接成1024*65,取前64个
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
     depth_map = torch.sum(weights * z_vals, -1)
@@ -348,27 +351,27 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
-    N_rays = ray_batch.shape[0]
+    N_rays = ray_batch.shape[0] # N*11
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
-    near, far = bounds[...,0], bounds[...,1] # [-1,1]
+    near, far = bounds[...,0], bounds[...,1] # [-1,1] 1024*1
 
-    t_vals = torch.linspace(0., 1., steps=N_samples)
+    t_vals = torch.linspace(0., 1., steps=N_samples)    # o+td 中的t，均匀在ray上采样
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
 
-    z_vals = z_vals.expand([N_rays, N_samples])
+    z_vals = z_vals.expand([N_rays, N_samples])     # 1024*64
 
     if perturb > 0.:
         # get intervals between samples
-        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-        upper = torch.cat([mids, z_vals[...,-1:]], -1)
-        lower = torch.cat([z_vals[...,:1], mids], -1)
+        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])  # 求每两个点之间的中点，前面是N*63的矢量+N*63的矢量, index错开
+        upper = torch.cat([mids, z_vals[...,-1:]], -1)  # 把1concate在mids最后，（是区间的中间值63+1个远端点）
+        lower = torch.cat([z_vals[...,:1], mids], -1)   # 把0concate在mids前，（区间的中指+1个近端点）
         # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape)
+        t_rand = torch.rand(z_vals.shape)   # 1024*64
 
         # Pytest, overwrite u with numpy's fixed random numbers
         if pytest:
@@ -376,24 +379,24 @@ def render_rays(ray_batch,
             t_rand = np.random.rand(*list(z_vals.shape))
             t_rand = torch.Tensor(t_rand)
 
-        z_vals = lower + (upper - lower) * t_rand
+        z_vals = lower + (upper - lower) * t_rand   # 在每个中点之间均匀的采样的点
 
-    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
+    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3] 1024,64,3 o+td
 
 
 #     raw = run_network(pts)
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    raw = network_query_fn(pts, viewdirs, network_fn)   # 1024根光线，每根采样64个点，的alpha和rgb
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
-
+        # finemodel里采样点
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
+        z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)   # 1024*64个点
         z_samples = z_samples.detach()
 
-        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)  # coars and fine 采样的点全部加起来
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
         run_fn = network_fn if network_fine is None else network_fine
@@ -543,14 +546,14 @@ def train():
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify)
         hwf = poses[0,:3,-1]
-        poses = poses[:,:3,:4]
+        poses = poses[:,:3,:4]  # 20*3*4 最后一个维度微 h，w，focus提取为hwf
         print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
         if not isinstance(i_test, list):
             i_test = [i_test]
 
         if args.llffhold > 0:
             print('Auto LLFF holdout,', args.llffhold)
-            i_test = np.arange(images.shape[0])[::args.llffhold]
+            i_test = np.arange(images.shape[0])[::args.llffhold]    # 按照8的间隔选择test的图片 【0，8，16】
 
         i_val = i_test
         i_train = np.array([i for i in np.arange(int(images.shape[0])) if
@@ -612,6 +615,7 @@ def train():
     H, W = int(H), int(W)
     hwf = [H, W, focal]
 
+    # 像素内参，从相机坐标系到像素坐标系的映射 X_p = KX_c
     if K is None:
         K = np.array([
             [focal, 0, 0.5*W],
@@ -648,7 +652,7 @@ def train():
     render_kwargs_test.update(bds_dict)
 
     # Move testing data to GPU
-    render_poses = torch.Tensor(render_poses).to(device)
+    render_poses = torch.Tensor(render_poses).to(device)    # render_poses (120,3,4)
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
@@ -677,11 +681,11 @@ def train():
     if use_batching:
         # For random ray batching
         print('get rays')
-        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd (2), H, W, 3] 遍历20个外参矩阵p=c2w(旋转3*3，平移1*3),生成20个图像对应的 378*504*3 rd 方向，以及378*504*3 ro的光线始发点
         print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
+        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb(3), H, W, 3] 带上了每个点的rgb
+        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb(3), 3]
+        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only (17,378,504,ro+rd+rgb(3),3)
         rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
@@ -714,9 +718,9 @@ def train():
         # Sample random ray batch
         if use_batching:
             # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?] [1024,3(ro+rd+rgb),3]   # 17张图工共17*378*504束光线中采样N_rand个rays
+            batch = torch.transpose(batch, 0, 1) #[1024, 3,3] -> [3, 1024,3]
+            batch_rays, target_s = batch[:2], batch[2]  # batch_rays 2,1024,3 是ray的起始点和角度， target_s [1024,3]是rgb groundtruh
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
